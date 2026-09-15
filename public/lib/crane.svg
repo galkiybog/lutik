@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <g stroke="#b8543f" stroke-width="1.5" stroke-linejoin="round">
+    <!-- крылья -->
+    <path d="M100 110 L22 76 L50 130 Z" fill="#f4ab98"/>
+    <path d="M100 110 L178 76 L150 130 Z" fill="#e7876e"/>
+    <!-- хвост -->
+    <path d="M100 110 L142 44 L129 41 L94 104 Z" fill="#eb9179"/>
+    <!-- шея и голова -->
+    <path d="M100 110 L64 34 L78 31 L110 104 Z" fill="#f7c0b0"/>
+    <path d="M64 34 L43 29 L70 47 Z" fill="#d9654d"/>
+    <!-- тело -->
+    <path d="M100 110 L85 147 L100 163 L115 147 Z" fill="#f2998a"/>
+    <!-- складки -->
+    <path d="M100 110 L60 100" fill="none" opacity=".45"/>
+    <path d="M100 110 L142 100" fill="none" opacity=".45"/>
+  </g>
+  <ellipse cx="100" cy="172" rx="28" ry="5" fill="#000" opacity=".1"/>
+</svg>

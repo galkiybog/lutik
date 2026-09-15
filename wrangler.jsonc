@@ -1,0 +1,30 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "lutik-room",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+
+  // Статика (index.html, app.js, styles.css, картинки библиотеки) раздаётся с края сети.
+  // Воркер перехватывает только /api/*, всё остальное отдают ассеты.
+  // single-page-application нужен, чтобы адрес вида /r/ab12cd... отдавал index.html.
+  "assets": {
+    "directory": "./public/",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+
+  // Одна комната = один Durable Object. Внутри него SQLite-таблицы с объектами,
+  // пользователями, картинками и журналом событий, плюс открытые вебсокеты участников.
+  "durable_objects": {
+    "bindings": [
+      { "name": "ROOMS", "class_name": "Room" }
+    ]
+  },
+
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Room"] }
+  ],
+
+  "observability": { "enabled": true }
+}
