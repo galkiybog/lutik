@@ -18,17 +18,20 @@ const BACKGROUNDS = [
 
 const PALETTE = ["#e8975a", "#7fb8a4", "#c98fc0", "#8aa8e0", "#e5c35c", "#e2685f", "#9ad17a", "#d99a7e"];
 
+const MAX_SOURCE = 10 * 1024 * 1024; // сколько весит файл, который можно выбрать
+const TARGET_OBJECT = 800_000; // до скольки жмём объект
+const TARGET_BACKGROUND = 1_500_000; // до скольки жмём фон
+
 const S = {
   roomId: null,
   seq: 0,
   room: null,
   users: [],
   me: null,
-  objects: new Map(), // id -> { data, el }
+  objects: new Map(), // id -> { data, el, btn }
   ws: null,
   wsOk: false,
   drag: null,
-  selected: null,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -86,6 +89,20 @@ function closeModal() {
   modal.innerHTML = "";
 }
 
+function toast(text) {
+  let el = $("#toast");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "toast";
+    el.className = "toast";
+    document.body.append(el);
+  }
+  el.textContent = text;
+  el.hidden = false;
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => { el.hidden = true; }, 3200);
+}
+
 // ─────────────────────────── экран создания ───────────────────────────
 
 function initCreateScreen() {
@@ -118,6 +135,10 @@ function initCreateScreen() {
     if (customFile) custom.style.borderColor = "var(--accent)";
     custom.onclick = () => pickFile().then((file) => {
       if (!file) return;
+      if (file.size > MAX_SOURCE) {
+        toast(`Картинка на ${Math.round(file.size / 1024 / 1024)} МБ — можно до 10 МБ`);
+        return;
+      }
       customFile = file;
       renderPicker();
     });
@@ -144,7 +165,8 @@ function initCreateScreen() {
       const { id } = await res.json();
 
       if (customFile) {
-        const blob = await shrinkImage(customFile, 1600);
+        btn.textContent = "Готовлю фон…";
+        const blob = await shrinkImage(customFile, 1800, TARGET_BACKGROUND);
         const up = await fetch(`/api/rooms/${id}/blobs`, {
           method: "POST",
           headers: { "content-type": blob.type },
@@ -157,6 +179,8 @@ function initCreateScreen() {
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ bg: src }),
           });
+        } else {
+          toast("Фон не загрузился, поставил пресет — поменяешь позже");
         }
       }
 
@@ -297,14 +321,12 @@ function applyEvent(event) {
       if (S.drag && S.drag.id === p.id) break; // не дёргаем то, что сейчас тащим сами
       Object.assign(entry.data, p);
       layout(entry);
-      if (S.selected === p.id) syncSliders();
       break;
     }
 
     case "object.del": {
       const entry = S.objects.get(p.id);
       if (!entry) break;
-      if (S.selected === p.id) deselect();
       entry.el.remove();
       S.objects.delete(p.id);
       break;
@@ -324,19 +346,24 @@ function baseSize() {
 }
 
 function layout(entry) {
-  const { data, el } = entry;
+  const { data, el, btn } = entry;
   const size = baseSize();
   el.style.width = `${size}px`;
   el.style.height = `${size}px`;
   el.style.left = `${data.x * 100}%`;
   el.style.top = `${data.y * 100}%`;
   el.style.zIndex = String(data.z);
-  el.style.transform =
-    `translate(-50%, -100%) rotateX(${data.rx}deg) rotateY(${data.ry}deg) rotateZ(${data.rz}deg) scale(${data.scale})`;
+  el.style.transform = `translate(-50%, -100%) scale(${data.scale})`;
+  // кнопка удаления не должна расти вместе с объектом
+  btn.style.transform = `scale(${1 / data.scale})`;
 }
 
 function layoutAll() {
   for (const entry of S.objects.values()) layout(entry);
+}
+
+function disarmAll() {
+  for (const { el } of S.objects.values()) el.classList.remove("armed");
 }
 
 function addObjectEl(data, { animate }) {
@@ -348,15 +375,41 @@ function addObjectEl(data, { animate }) {
   img.src = srcUrl(data.src);
   img.draggable = false;
   img.alt = "";
-  el.append(img);
 
-  const entry = { data: { ...data }, el };
+  const btn = document.createElement("button");
+  btn.className = "obj-delete";
+  btn.type = "button";
+  btn.setAttribute("aria-label", "Удалить объект");
+  btn.textContent = "✕";
+
+  el.append(img, btn);
+
+  const entry = { data: { ...data }, el, btn };
   S.objects.set(data.id, entry);
   objectsLayer.append(el);
   layout(entry);
   attachGestures(entry);
+
+  btn.addEventListener("pointerdown", (e) => e.stopPropagation());
+  btn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    removeObject(data.id);
+  });
+
   if (animate) setTimeout(() => el.classList.remove("appearing"), 400);
   return entry;
+}
+
+async function removeObject(id) {
+  const entry = S.objects.get(id);
+  if (!entry) return;
+  entry.el.remove();
+  S.objects.delete(id);
+  await api(`/objects/${id}`, {
+    method: "DELETE",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ by: S.me?.id }),
+  }).catch(() => {});
 }
 
 const patchObject = throttle((id, patch) => {
@@ -375,12 +428,24 @@ function patchNow(id, patch) {
   }).catch(() => {});
 }
 
+function setScale(entry, next) {
+  entry.data.scale = Math.min(3, Math.max(0.2, next));
+  layout(entry);
+  patchObject(entry.data.id, { scale: entry.data.scale });
+}
+
 function attachGestures(entry) {
   const { el } = entry;
   const pointers = new Map();
   let moved = 0;
   let startedAt = 0;
   let pinchStart = null;
+  let holdTimer = null;
+
+  const cancelHold = () => {
+    clearTimeout(holdTimer);
+    holdTimer = null;
+  };
 
   el.addEventListener("pointerdown", (e) => {
     if (!S.me) { openUserPicker({ dismissible: false }); return; }
@@ -392,10 +457,20 @@ function attachGestures(entry) {
       startedAt = Date.now();
       S.drag = { id: entry.data.id, lastX: e.clientX, lastY: e.clientY };
       el.classList.add("dragging");
-      // поднимаем наверх, чтобы тащить поверх остальных
       entry.data.z = Math.max(...[...S.objects.values()].map((o) => o.data.z), 0) + 1;
       el.style.zIndex = String(entry.data.z);
+
+      // долгое нажатие без движения показывает крестик
+      cancelHold();
+      holdTimer = setTimeout(() => {
+        if (moved < 8) {
+          disarmAll();
+          el.classList.add("armed");
+          if (navigator.vibrate) navigator.vibrate(12);
+        }
+      }, 450);
     } else if (pointers.size === 2) {
+      cancelHold();
       const [a, b] = [...pointers.values()];
       pinchStart = { dist: Math.hypot(a.x - b.x, a.y - b.y), scale: entry.data.scale };
     }
@@ -409,11 +484,7 @@ function attachGestures(entry) {
     if (pointers.size >= 2 && pinchStart) {
       const [a, b] = [...pointers.values()];
       const dist = Math.hypot(a.x - b.x, a.y - b.y);
-      const next = Math.min(3, Math.max(0.2, (pinchStart.scale * dist) / (pinchStart.dist || 1)));
-      entry.data.scale = next;
-      layout(entry);
-      if (S.selected === entry.data.id) syncSliders();
-      patchObject(entry.data.id, { scale: next });
+      setScale(entry, (pinchStart.scale * dist) / (pinchStart.dist || 1));
       return;
     }
 
@@ -424,6 +495,7 @@ function attachGestures(entry) {
     S.drag.lastX = e.clientX;
     S.drag.lastY = e.clientY;
     moved += Math.abs(dx) + Math.abs(dy);
+    if (moved >= 8) cancelHold();
 
     entry.data.x = Math.min(1.2, Math.max(-0.2, entry.data.x + dx / rect.width));
     entry.data.y = Math.min(1.2, Math.max(-0.2, entry.data.y + dy / rect.height));
@@ -436,100 +508,25 @@ function attachGestures(entry) {
     if (pointers.size < 2) pinchStart = null;
     if (pointers.size > 0) return;
 
+    cancelHold();
     el.classList.remove("dragging");
     const wasTap = moved < 8 && Date.now() - startedAt < 400;
     const id = entry.data.id;
     S.drag = null;
 
-    if (wasTap) {
-      select(id);
-      patchNow(id, { bringToFront: true });
-    } else {
-      patchNow(id, { x: entry.data.x, y: entry.data.y, scale: entry.data.scale, bringToFront: true });
-    }
+    if (wasTap) disarmAll();
+    patchNow(id, { x: entry.data.x, y: entry.data.y, scale: entry.data.scale, bringToFront: true });
   };
 
   el.addEventListener("pointerup", end);
   el.addEventListener("pointercancel", end);
-}
 
-// ─────────────────────────── выделение и панель ───────────────────────────
-
-const panel = $("#selection-panel");
-
-function select(id) {
-  deselect();
-  const entry = S.objects.get(id);
-  if (!entry) return;
-  S.selected = id;
-  entry.el.classList.add("selected");
-  const author = S.users.find((u) => u.id === entry.data.created_by);
-  $("#sel-author").textContent = !author
-    ? ""
-    : author.id === S.me?.id
-      ? "твой объект"
-      : `положил(а) ${author.name}`;
-  syncSliders();
-  panel.hidden = false;
-}
-
-function deselect() {
-  if (S.selected) S.objects.get(S.selected)?.el.classList.remove("selected");
-  S.selected = null;
-  panel.hidden = true;
-}
-
-function syncSliders() {
-  const entry = S.objects.get(S.selected);
-  if (!entry) return;
-  $("#sl-rx").value = entry.data.rx;
-  $("#sl-ry").value = entry.data.ry;
-  $("#sl-rz").value = entry.data.rz;
-  $("#sl-scale").value = entry.data.scale;
-}
-
-function wirePanel() {
-  const bind = (sel, key) => {
-    $(sel).addEventListener("input", (e) => {
-      const entry = S.objects.get(S.selected);
-      if (!entry) return;
-      entry.data[key] = Number(e.target.value);
-      layout(entry);
-      patchObject(entry.data.id, { [key]: entry.data[key] });
-    });
-  };
-  bind("#sl-rx", "rx");
-  bind("#sl-ry", "ry");
-  bind("#sl-rz", "rz");
-  bind("#sl-scale", "scale");
-
-  $("#sel-close").onclick = deselect;
-
-  $("#sel-reset").onclick = () => {
-    const entry = S.objects.get(S.selected);
-    if (!entry) return;
-    Object.assign(entry.data, { rx: 0, ry: 0, rz: 0 });
-    layout(entry);
-    syncSliders();
-    patchNow(entry.data.id, { rx: 0, ry: 0, rz: 0 });
-  };
-
-  $("#sel-delete").onclick = async () => {
-    const id = S.selected;
-    if (!id) return;
-    deselect();
-    S.objects.get(id)?.el.remove();
-    S.objects.delete(id);
-    await api(`/objects/${id}`, {
-      method: "DELETE",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ by: S.me?.id }),
-    }).catch(() => {});
-  };
-
-  stage.addEventListener("pointerdown", (e) => {
-    if (e.target === stage || e.target === objectsLayer) deselect();
-  });
+  // на компьютере колесо над объектом меняет размер
+  el.addEventListener("wheel", (e) => {
+    if (!S.me) return;
+    e.preventDefault();
+    setScale(entry, entry.data.scale * (e.deltaY < 0 ? 1.08 : 1 / 1.08));
+  }, { passive: false });
 }
 
 // ─────────────────────────── пользователи ───────────────────────────
@@ -655,22 +652,25 @@ async function placeObject(src) {
 
 async function uploadAndPlace(file) {
   if (!S.me) return openUserPicker({ dismissible: false });
+  if (file.size > MAX_SOURCE) {
+    toast(`Картинка на ${Math.round(file.size / 1024 / 1024)} МБ — можно до 10 МБ`);
+    return;
+  }
   try {
-    const blob = await shrinkImage(file, 900);
+    const blob = await shrinkImage(file, 1000, TARGET_OBJECT);
     const res = await api("/blobs", {
       method: "POST",
       headers: { "content-type": blob.type },
       body: blob,
     });
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      alert(err.error === "too_large" ? "Картинка слишком тяжёлая" : "Не получилось загрузить картинку");
+      toast("Не получилось загрузить картинку");
       return;
     }
     const { src } = await res.json();
     await placeObject(src);
   } catch {
-    alert("Не получилось прочитать картинку");
+    toast("Не получилось прочитать картинку");
   }
 }
 
@@ -682,24 +682,34 @@ function pickFile() {
   });
 }
 
-// Сжимаем на клиенте: в Durable Object летит уже лёгкий webp, а не фото на 5 МБ.
-async function shrinkImage(file, maxSide) {
+// Жмём на клиенте: в Durable Object летит лёгкий webp, а не фото на 10 МБ.
+// Сначала убавляем качество, потом — размер, пока не влезем в target.
+async function shrinkImage(file, maxSide, target) {
   const bitmap = await createImageBitmap(file);
-  const ratio = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
-  const w = Math.max(1, Math.round(bitmap.width * ratio));
-  const h = Math.max(1, Math.round(bitmap.height * ratio));
-
   const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  canvas.getContext("2d").drawImage(bitmap, 0, 0, w, h);
-  bitmap.close?.();
+  const ctx = canvas.getContext("2d");
+  let best = null;
 
-  for (const quality of [0.82, 0.6, 0.4]) {
-    const blob = await new Promise((res) => canvas.toBlob(res, "image/webp", quality));
-    if (blob && blob.size <= 1_000_000) return blob;
+  for (const side of [maxSide, maxSide * 0.8, maxSide * 0.62, maxSide * 0.48]) {
+    const ratio = Math.min(1, side / Math.max(bitmap.width, bitmap.height));
+    canvas.width = Math.max(1, Math.round(bitmap.width * ratio));
+    canvas.height = Math.max(1, Math.round(bitmap.height * ratio));
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+
+    for (const quality of [0.82, 0.68, 0.52, 0.4]) {
+      const blob = await new Promise((res) => canvas.toBlob(res, "image/webp", quality));
+      if (!blob) continue;
+      best = blob;
+      if (blob.size <= target) {
+        bitmap.close?.();
+        return blob;
+      }
+    }
   }
-  throw new Error("too_large");
+
+  bitmap.close?.();
+  if (best) return best; // отдаём самый лёгкий вариант, сервер решит
+  throw new Error("cannot_encode");
 }
 
 // ─────────────────────────── поделиться ───────────────────────────
@@ -736,10 +746,13 @@ function escapeHtml(str) {
 // ─────────────────────────── старт ───────────────────────────
 
 function boot() {
-  wirePanel();
   $("#add-btn").onclick = () => (S.me ? openLibrary() : openUserPicker({ dismissible: false }));
   $("#user-btn").onclick = () => openUserPicker();
   $("#share-btn").onclick = openShare;
+
+  stage.addEventListener("pointerdown", (e) => {
+    if (e.target === stage || e.target === objectsLayer) disarmAll();
+  });
 
   document.addEventListener("paste", (e) => {
     if ($("#screen-room").hidden || !modalRoot.hidden) return;
@@ -751,7 +764,7 @@ function boot() {
   });
 
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") { if (!modalRoot.hidden) closeModal(); else deselect(); }
+    if (e.key === "Escape") { if (!modalRoot.hidden) closeModal(); else disarmAll(); }
   });
 
   const match = location.pathname.match(/^\/r\/([A-Za-z0-9]{6,40})$/);

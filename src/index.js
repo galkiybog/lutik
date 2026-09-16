@@ -6,7 +6,7 @@ import { DurableObject } from "cloudflare:workers";
 
 const ALPHABET = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // без похожих символов
 const ROOM_ID_LEN = 22; // ~128 бит энтропии — подобрать перебором нереально
-const MAX_BLOB = 1_100_000; // ~1 МБ: клиент жмёт картинки заранее
+const MAX_BLOB = 12_000_000; // временно для замера предела SQLite
 const MAX_OBJECTS = 300;
 const MAX_EVENTS = 4000; // журнал подрезаем, чтобы комната не росла вечно
 
